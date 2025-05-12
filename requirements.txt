@@ -4,7 +4,7 @@ uvicorn
 requests
 pandas
 pillow
-ultralytics==8.0.20
+ultralytics
 python-multipart
 
 
