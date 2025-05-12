@@ -3,7 +3,8 @@ fastapi
 uvicorn
 requests
 pandas
-ultralytics
-Pillow
+pillow
+ultralytics==8.0.20
+python-multipart
 
 
