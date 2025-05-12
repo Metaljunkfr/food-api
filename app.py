@@ -125,6 +125,8 @@ def find_nutrient(nutrients, id):
 
 
 # ==================== RUN FASTAPI SERVER ====================
-if _name_ == "_main_":
+if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import os
+    port = int(os.environ.get("PORT", 10000))  # Render fournit le port dans cette variable
+    uvicorn.run(app, host="0.0.0.0", port=port)
