@@ -2,55 +2,78 @@ import io
 import os
 import requests
 from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
+from PIL import Image, UnidentifiedImageError
 from ultralytics import YOLO
-from PIL import Image
 
-# Initialize FastAPI app
 app = FastAPI()
 
 # ==================== DOWNLOAD & LOAD YOLO MODEL ====================
 MODEL_PATH = "models/yolov8_food.pt"
 if not os.path.exists(MODEL_PATH):
-    print("Downloading YOLO model...")
+    print("📦 Downloading YOLO model...")
     os.makedirs("models", exist_ok=True)
     url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt"
     response = requests.get(url, stream=True)
     with open(MODEL_PATH, "wb") as f:
         for chunk in response.iter_content(chunk_size=1024 * 1024):
             f.write(chunk)
-    print("YOLO model downloaded!")
+    print("✅ YOLO model downloaded!")
 
 model = YOLO(MODEL_PATH)
 
 # ==================== IMAGE UPLOAD ENDPOINT ====================
 @app.post("/upload/")
 async def upload_image(file: UploadFile = File(...)):
-    image = Image.open(io.BytesIO(await file.read()))
-    results = model(image)
-    detected_foods = set()
+    try:
+        contents = await file.read()
+        print(f"🖼️ Fichier reçu : {file.filename} ({len(contents)} octets)")
 
-    for result in results:
-        for box in result.boxes:
-            detected_foods.add(result.names[int(box.cls)])
+        if not contents:
+            return JSONResponse(content={"error": "Fichier vide"}, status_code=400)
 
-    if not detected_foods:
-        return {"error": "No food detected"}
+        try:
+            image = Image.open(io.BytesIO(contents))
+            image.verify()  # Vérification rapide
+            image = Image.open(io.BytesIO(contents))  # Recharge utilisable
+        except UnidentifiedImageError:
+            return JSONResponse(content={"error": "Format de l'image non reconnu"}, status_code=400)
 
-    nutrition_info = {}
-    for food in detected_foods:
-        nutrition_info[food] = get_nutrition(food)
+        print(f"✅ Image décodée : {image.format}, {image.size}, {image.mode}")
 
-    return {"foods_detected": list(detected_foods), "nutrition_info": nutrition_info}
+        results = model(image)
+        detected_foods = set()
+
+        for result in results:
+            for box in result.boxes:
+                detected_foods.add(result.names[int(box.cls)])
+
+        if not detected_foods:
+            return {"error": "Aucun aliment détecté"}
+
+        nutrition_info = {}
+        for food in detected_foods:
+            nutrition_info[food] = get_nutrition(food)
+
+        return {"foods_detected": list(detected_foods), "nutrition_info": nutrition_info}
+
+    except Exception as e:
+        print("❌ Erreur serveur :", str(e))
+        return JSONResponse(content={"error": "Erreur interne du serveur"}, status_code=500)
 
 # ==================== NUTRITION LOOKUP FUNCTIONS ====================
 def get_nutrition(food_name):
     nutrition = fetch_openfoodfacts(food_name)
     if not nutrition:
         nutrition = fetch_usda(food_name)
-    return nutrition if nutrition else {"calories": "Unknown", "protein": "Unknown", "carbs": "Unknown", "fat": "Unknown"}
+    return nutrition if nutrition else {
+        "calories": "Unknown",
+        "protein": "Unknown",
+        "carbs": "Unknown",
+        "fat": "Unknown"
+    }
 
 def fetch_openfoodfacts(food_name):
-    """Query OpenFoodFacts live API"""
     url = "https://world.openfoodfacts.org/cgi/search.pl"
     params = {
         "search_terms": food_name,
@@ -75,7 +98,6 @@ def fetch_openfoodfacts(food_name):
     return None
 
 def fetch_usda(food_name):
-    """Query USDA API with fallback"""
     USDA_API_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
     USDA_API_KEY = "cUpQEPw6MoVYHor57x8C3mX1ob1ANENgiWfkCYcZ"
     try:

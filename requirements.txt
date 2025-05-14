@@ -6,5 +6,5 @@ pandas
 pillow
 ultralytics
 python-multipart
-
+kagglehub
 
