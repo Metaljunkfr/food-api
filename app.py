@@ -2,24 +2,35 @@ import io
 import os
 import requests
 from jobs import jobs, start_job
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, UnidentifiedImageError
 from ultralytics import YOLO
+from config import *
+from logger import logger
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-app = FastAPI()
+app = FastAPI(title="Food API", version="1.0.0")
+
+# Configuration CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ==================== DOWNLOAD & LOAD YOLO MODEL ====================
-MODEL_PATH = "models/yolov8_food.pt"
 if not os.path.exists(MODEL_PATH):
-    print("📦 Downloading YOLO model...")
+    logger.info("📦 Téléchargement du modèle YOLO...")
     os.makedirs("models", exist_ok=True)
-    url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt"
-    response = requests.get(url, stream=True)
+    response = requests.get(MODEL_URL, stream=True)
     with open(MODEL_PATH, "wb") as f:
         for chunk in response.iter_content(chunk_size=1024 * 1024):
             f.write(chunk)
-    print("✅ YOLO model downloaded!")
+    logger.info("✅ Modèle YOLO téléchargé!")
 
 model = YOLO(MODEL_PATH)
 
@@ -27,48 +38,59 @@ model = YOLO(MODEL_PATH)
 @app.post("/upload/")
 async def upload_image(file: UploadFile = File(...)):
     try:
+        # Vérification de la taille du fichier
         contents = await file.read()
-        print(f"🖼️ Fichier reçu : {file.filename} ({len(contents)} octets)")
+        if len(contents) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail="Fichier trop volumineux")
+
+        logger.info(f"🖼️ Fichier reçu : {file.filename} ({len(contents)} octets)")
 
         if not contents:
-            return JSONResponse(content={"error": "Fichier vide"}, status_code=400)
+            raise HTTPException(status_code=400, detail="Fichier vide")
+
+        # Vérification du type MIME
+        content_type = file.content_type
+        if content_type not in ALLOWED_MIME_TYPES:
+            raise HTTPException(status_code=415, detail="Format de fichier non supporté")
 
         try:
             image = Image.open(io.BytesIO(contents))
             image.verify()
-            image = Image.open(io.BytesIO(contents))  # Recharge utilisable
+            image = Image.open(io.BytesIO(contents))
         except UnidentifiedImageError:
-            return JSONResponse(content={"error": "Format de l'image non reconnu"}, status_code=400)
+            raise HTTPException(status_code=400, detail="Format de l'image non reconnu")
 
-        print(f"✅ Image décodée : {image.format}, {image.size}, {image.mode}")
+        logger.info(f"✅ Image décodée : {image.format}, {image.size}, {image.mode}")
 
         job_id = start_job(image, model, get_nutrition)
         return {"job_id": job_id}
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        print("❌ Erreur serveur :", str(e))
-        return JSONResponse(content={"error": "Erreur interne du serveur"}, status_code=500)
+        logger.error(f"❌ Erreur serveur : {str(e)}")
+        raise HTTPException(status_code=500, detail="Erreur interne du serveur")
 
 # ==================== JOB RESULT ENDPOINT ====================
 @app.get("/result/{job_id}")
 async def get_result(job_id: str):
     job = jobs.get(job_id)
     if not job:
-        return JSONResponse(content={"error": "ID inconnu"}, status_code=404)
+        raise HTTPException(status_code=404, detail="ID inconnu")
 
     if job["status"] == "done":
         return job["result"]
     elif job["status"] == "processing":
         return {"status": "processing"}
     else:
-        return JSONResponse(content={"error": job.get("message", "Erreur inconnue")}, status_code=500)
+        raise HTTPException(status_code=500, detail=job.get("message", "Erreur inconnue"))
 
 # ==================== NUTRITION LOOKUP FUNCTIONS ====================
 def get_nutrition(food_name):
-    print(f"🔍 Recherche nutrition pour : {food_name}")
+    logger.info(f"🔍 Recherche nutrition pour : {food_name}")
     nutrition = fetch_openfoodfacts(food_name)
     if not nutrition:
-        print("⚠️ OpenFoodFacts n'a rien trouvé, on tente USDA...")
+        logger.warning("⚠️ OpenFoodFacts n'a rien trouvé, on tente USDA...")
         nutrition = fetch_usda(food_name)
     return nutrition if nutrition else {
         "calories": "Unknown",
@@ -77,23 +99,28 @@ def get_nutrition(food_name):
         "fat": "Unknown"
     }
 
+@retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=RETRY_DELAY))
 def fetch_openfoodfacts(food_name):
-    url = "https://world.openfoodfacts.org/cgi/search.pl"
-    params = {
-        "search_terms": food_name,
-        "search_simple": 1,
-        "action": "process",
-        "json": 1,
-        "page_size": 10
-    }
     try:
-        response = requests.get(url, params=params)
+        params = {
+            "search_terms": food_name,
+            "search_simple": 1,
+            "action": "process",
+            "json": 1,
+            "page_size": 10
+        }
+        response = requests.get(
+            OPENFOODFACTS_URL,
+            params=params,
+            timeout=REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
         data = response.json()
         products = data.get("products", [])
         for product in products:
             nutrients = product.get("nutriments", {})
             if "energy-kcal_100g" in nutrients:
-                print(f"✅ Nutriments trouvés via OFF : {product.get('product_name', 'Inconnu')}")
+                logger.info(f"✅ Nutriments trouvés via OFF : {product.get('product_name', 'Inconnu')}")
                 return {
                     "calories": nutrients.get("energy-kcal_100g", "Unknown"),
                     "protein": nutrients.get("proteins_100g", "Unknown"),
@@ -101,20 +128,27 @@ def fetch_openfoodfacts(food_name):
                     "fat": nutrients.get("fat_100g", "Unknown")
                 }
     except Exception as e:
-        print(f"❌ Erreur OpenFoodFacts : {e}")
+        logger.error(f"❌ Erreur OpenFoodFacts : {e}")
     return None
 
+@retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=RETRY_DELAY))
 def fetch_usda(food_name):
-    USDA_API_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
-    USDA_API_KEY = "cUpQEPw6MoVYHor57x8C3mX1ob1ANENgiWfkCYcZ"
     try:
-        params = {"query": food_name, "api_key": USDA_API_KEY}
-        response = requests.get(USDA_API_URL, params=params)
+        params = {
+            "query": food_name,
+            "api_key": USDA_API_KEY
+        }
+        response = requests.get(
+            USDA_API_URL,
+            params=params,
+            timeout=REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
         data = response.json()
         foods = data.get("foods", [])
         if foods:
             nutrients = foods[0].get("foodNutrients", [])
-            print(f"✅ Nutriments trouvés via USDA : {foods[0].get('description', 'Inconnu')}")
+            logger.info(f"✅ Nutriments trouvés via USDA : {foods[0].get('description', 'Inconnu')}")
             return {
                 "calories": find_nutrient(nutrients, 208),
                 "protein": find_nutrient(nutrients, 203),
@@ -122,7 +156,7 @@ def fetch_usda(food_name):
                 "fat": find_nutrient(nutrients, 204)
             }
     except Exception as e:
-        print(f"❌ Erreur USDA : {e}")
+        logger.error(f"❌ Erreur USDA : {e}")
     return None
 
 def find_nutrient(nutrients, nutrient_id):
